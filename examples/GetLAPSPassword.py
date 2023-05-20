@@ -22,6 +22,7 @@
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
+from binascii import hexlify, unhexlify
 from datetime import datetime
 from impacket import version
 from impacket.dcerpc.v5 import transport
@@ -42,9 +43,25 @@ import logging
 import os
 import sys
 
-
 class GetLAPSPassword:
-    def __init__(self, username, password, domain, cmdLineOptions, output_file=None):
+    @staticmethod
+    def printTable(items, header):
+        colLen = []
+        for i, col in enumerate(header):
+            rowMaxLen = max([len(row[i]) for row in items])
+            colLen.append(max(rowMaxLen, len(col)))
+
+        outputFormat = ' '.join(['{%d:%ds} ' % (num, width) for num, width in enumerate(colLen)])
+
+        # Print header
+        print(outputFormat.format(*header))
+        print('  '.join(['-' * itemLen for itemLen in colLen]))
+
+        # And now the rows
+        for row in items:
+            print(outputFormat.format(*row))
+
+    def __init__(self, username, password, domain, cmdLineOptions):
         self.options = cmdLineOptions
         self.__username = username
         self.__password = password
@@ -54,12 +71,10 @@ class GetLAPSPassword:
         self.__nthash = ''
         self.__aesKey = cmdLineOptions.aesKey
         self.__doKerberos = cmdLineOptions.k
-        #[!] in this script the value of -dc-ip option is self.__kdcIP and the value of -dc-host option is self.__kdcHost
         self.__kdcIP = cmdLineOptions.dc_ip
         self.__kdcHost = cmdLineOptions.dc_host
         self.__targetComputer = cmdLineOptions.computer
-        self.__allComputers = cmdLineOptions.all_computers
-        self.__lapsv2 = cmdLineOptions.lapsv2
+        self.__KDSCache = {}
 
         if cmdLineOptions.hashes is not None:
             self.__lmhash, self.__nthash = cmdLineOptions.hashes.split(':')
@@ -72,48 +87,69 @@ class GetLAPSPassword:
         # Remove last ','
         self.baseDN = self.baseDN[:-1]
 
-        if self.__lapsv2:
-            self.__header = ["Name", "LAPS Username", "LAPS Password", "LAPS Password Expiration"]
-            self.__colLen = [20, 20, 20, 30]
+    def getLAPSv2Decrypt(self, rawEncryptedLAPSBlob):
+        try:
+            encryptedLAPSBlob = EncryptedPasswordBlob(rawEncryptedLAPSBlob)
+            parsed_cms_data, remaining = decoder.decode(encryptedLAPSBlob['Blob'], asn1Spec=rfc5652.ContentInfo())
+            enveloped_data_blob = parsed_cms_data['content']
+            parsed_enveloped_data, _ = decoder.decode(enveloped_data_blob, asn1Spec=rfc5652.EnvelopedData())
+
+            recipient_infos = parsed_enveloped_data['recipientInfos']
+            kek_recipient_info = recipient_infos[0]['kekri']
+            kek_identifier = kek_recipient_info['kekid'] 
+            key_id = KeyIdentifier(bytes(kek_identifier['keyIdentifier']))
+            tmp,_ = decoder.decode(kek_identifier['other']['keyAttr'])
+            sid = tmp['field-1'][0][0][1].asOctets().decode("utf-8") 
+            target_sd = create_sd(sid)
+            laps_enabled = True
+        except Exception as e:
+            logging.error('Cannot unpack msLAPS-EncryptedPassword blob due to error %s' % str(e))
+        # Check if item is in cache
+        if key_id['RootKeyId'] in self.__KDSCache:
+            gke = self.__KDSCache[key_id['RootKeyId']]
         else:
-            self.__header = ["Name", "LAPS Password", "LAPS Password Expiration"]
-            self.__colLen = [20, 20, 30]
+            # Connect on RPC over TCP to MS-GKDI to call opnum 0 GetKey 
+            stringBinding = hept_map(destHost=self.__target, remoteIf=MSRPC_UUID_GKDI, protocol = 'ncacn_ip_tcp')
+            rpctransport = transport.DCERPCTransportFactory(stringBinding)
+            if hasattr(rpctransport, 'set_credentials'):
+                rpctransport.set_credentials(username=self.__username, password=self.__password, domain=self.__domain, lmhash=self.__lmhash, nthash=self.__nthash)
+            if self.__doKerberos:
+                rpctransport.set_kerberos(self.__doKerberos, kdcHost=self.__target)
+            if self.__kdcIP is not None:
+                rpctransport.setRemoteHost(self.__kdcIP)
+                rpctransport.setRemoteName(self.__target)
 
-        self.__outputFormat = '| '.join(['{%d:%ds} ' % (num, width) for num, width in enumerate(self.__colLen)])
+            dce = rpctransport.get_dce_rpc()
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+            logging.debug("Connecting to %s" % stringBinding)
+            try:
+                dce.connect()
+            except Exception as e:
+                logging.error("Something went wrong, check error status => %s" % str(e))
+                return laps_enabled
+            logging.debug("Connected")
+            try:
+                dce.bind(MSRPC_UUID_GKDI)
+            except Exception as e:
+                logging.error("Something went wrong, check error status => %s" % str(e))
+                return laps_enabled
+            logging.debug("Successfully bound")
 
-        # Output file magic
-        self.__output_file = output_file
 
-        # If output_file is provided, open it in write mode
-        if self.__output_file:
-            self.__file = open(self.__output_file, 'w')
-    
-    def __write_to_file(self, data):
-        if self.__output_file:
-            self.__file.write(data + '\n')
+            logging.debug("Calling MS-GKDI GetKey")
+            resp = GkdiGetKey(dce, target_sd=target_sd, l0=key_id['L0Index'], l1=key_id['L1Index'], l2=key_id['L2Index'], root_key_id=key_id['RootKeyId'])
+            # Unpack GroupKeyEnvelope
+            gke = GroupKeyEnvelope(b''.join(resp['pbbOut']))
+        self.__KDSCache[gke['RootKeyId']] = gke
 
-    def test_output_file(self):
-        if not self.__output_file:
-            print("No output file specified.")
-            return
-
-        # Generate sample data
-        sample_data = [
-            ("Computer1", "SamplePassword1", "2023-05-15 13:23:00"),
-            ("Computer2", "SamplePassword2", "2023-06-10 08:45:30"),
-        ]
-
-        # Print and write sample data
-        for data in sample_data:
-            data_line = '|'.join(data)
-            print(data_line)
-            self.__write_to_file(data_line)
-
-        print("Sample data written to the output file.")
-
-    def finish(self):
-        if self.__output_file:
-            self.__file.close()
+        kek = compute_kek(gke, key_id)
+        enc_content_parameter = bytes(parsed_enveloped_data["encryptedContentInfo"]["contentEncryptionAlgorithm"]["parameters"])
+        iv, _ = decoder.decode(enc_content_parameter)
+        iv = bytes(iv[0])
+        
+        cek = unwrap_cek(kek, bytes(kek_recipient_info['encryptedKey']))
+        return decrypt_plaintext(cek, iv, remaining)
 
     def getMachineName(self, target):
         try:
@@ -143,117 +179,6 @@ class GetLAPSPassword:
         t -= 116444736000000000
         t /= 10000000
         return t
-
-    def processRecord(self, item):
-        if isinstance(item, ldapasn1.SearchResultEntry) is not True:
-            return
-        cn = 'N/A'
-        lapsUsername = 'N/A'
-        lapsPassword = 'N/A'
-        lapsPasswordExpiration = 'N/A'
-        laps_enabled = False
-        try:
-            for attribute in item['attributes']:
-                if str(attribute['type']) == 'cn':
-                    cn = attribute['vals'][0].asOctets().decode('utf-8')
-                elif str(attribute['type']) == 'ms-Mcs-AdmPwdExpirationTime':
-                    if str(attribute['vals'][0]) == '0':
-                        lapsPasswordExpiration = 'N/A'
-                    else:
-                        lapsPasswordExpiration = datetime.fromtimestamp(self.getUnixTime(int(str(attribute['vals'][0])))).strftime('%Y-%m-%d %H:%M:%S')
-                elif str(attribute['type']) == 'ms-Mcs-AdmPwd':
-                    lapsPassword = attribute['vals'][0].asOctets().decode('utf-8')
-                    laps_enabled = True
-                elif str(attribute['type']) == 'msLAPS-EncryptedPassword':  # Checking for msLAPS-EncryptedPassword
-                    rawEncryptedLAPSBlob = bytes(attribute['vals'][0])
-                    KDSCache = {}
-                    try:
-                        encryptedLAPSBlob = EncryptedPasswordBlob(rawEncryptedLAPSBlob)
-                        parsed_cms_data, remaining = decoder.decode(encryptedLAPSBlob['Blob'], asn1Spec=rfc5652.ContentInfo())
-                        enveloped_data_blob = parsed_cms_data['content']
-                        parsed_enveloped_data, _ = decoder.decode(enveloped_data_blob, asn1Spec=rfc5652.EnvelopedData())
-
-                        recipient_infos = parsed_enveloped_data['recipientInfos']
-                        kek_recipient_info = recipient_infos[0]['kekri']
-                        kek_identifier = kek_recipient_info['kekid'] 
-                        key_id = KeyIdentifier(bytes(kek_identifier['keyIdentifier']))
-                        tmp,_ = decoder.decode(kek_identifier['other']['keyAttr'])
-                        sid = tmp['field-1'][0][0][1].asOctets().decode("utf-8") 
-                        target_sd = create_sd(sid)
-                        laps_enabled = True
-                    except Exception as e:
-                        logging.error('Cannot unpack msLAPS-EncryptedPassword blob due to error %s' % str(e))
-                    # Check if item is in cache
-                    if key_id['RootKeyId'] in KDSCache:
-                        logging.debug("Got KDS from cache")
-                        gke = KDSCache[key_id['RootKeyId']]
-                    else:
-                        # Connect on RPC over TCP to MS-GKDI to call opnum 0 GetKey 
-                        stringBinding = hept_map(destHost=self.__target, remoteIf=MSRPC_UUID_GKDI, protocol = 'ncacn_ip_tcp')
-                        rpctransport = transport.DCERPCTransportFactory(stringBinding)
-                        if hasattr(rpctransport, 'set_credentials'):
-                            rpctransport.set_credentials(username=self.__username, password=self.__password, domain=self.__domain, lmhash=self.__lmhash, nthash=self.__nthash)
-                        if self.__doKerberos:
-                            rpctransport.set_kerberos(self.__doKerberos, kdcHost=self.__target)
-                        if self.__kdcIP is not None:
-                            rpctransport.setRemoteHost(self.__kdcIP)
-                            rpctransport.setRemoteName(self.__target)
-
-                        dce = rpctransport.get_dce_rpc()
-                        dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
-                        dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
-                        logging.debug("Connecting to %s" % stringBinding)
-                        try:
-                            dce.connect()
-                        except Exception as e:
-                            logging.error("Something went wrong, check error status => %s" % str(e))
-                            return laps_enabled
-                        logging.debug("Connected")
-                        try:
-                            dce.bind(MSRPC_UUID_GKDI)
-                        except Exception as e:
-                            logging.error("Something went wrong, check error status => %s" % str(e))
-                            return laps_enabled
-                        logging.debug("Successfully bound")
-
-
-                        logging.debug("Calling MS-GKDI GetKey")
-                        resp = GkdiGetKey(dce, target_sd=target_sd, l0=key_id['L0Index'], l1=key_id['L1Index'], l2=key_id['L2Index'], root_key_id=key_id['RootKeyId'])
-                        logging.debug("Decrypting password")
-                        # Unpack GroupKeyEnvelope
-                        gke = GroupKeyEnvelope(b''.join(resp['pbbOut']))
-                        KDSCache[gke['RootKeyId']] = gke
-
-                        kek = compute_kek(gke, key_id)
-                        logging.debug("KEK:\t%s" % kek)
-                        enc_content_parameter = bytes(parsed_enveloped_data["encryptedContentInfo"]["contentEncryptionAlgorithm"]["parameters"])
-                        iv, _ = decoder.decode(enc_content_parameter)
-                        iv = bytes(iv[0])
-
-                        cek = unwrap_cek(kek, bytes(kek_recipient_info['encryptedKey']))
-                        logging.debug("CEK:\t%s" % cek)
-                        plaintext = decrypt_plaintext(cek, iv, remaining)
-
-            if self.__lapsv2:
-                json_str = plaintext[:-18].decode('utf-16le')
-                json_obj = json.loads(json_str)  # parse JSON string into Python dictionary
-                lapsUsername = json_obj.get('n', 'N/A')  # if 'n' key does not exist, 'N/A' is returned
-                lapsPassword = json_obj.get('p', 'N/A')
-                print(self.__outputFormat.format(*[cn, lapsUsername, lapsPassword, lapsPasswordExpiration]))
-            else:
-                print((self.__outputFormat.format(*[cn, lapsPassword, lapsPasswordExpiration])))
-        except Exception as e:
-            logging.error('Error processing record: %s', str(e))
-            logging.debug(item, exc_info=True)
-            pass
-        if self.__lapsv2:
-            output_line = self.__outputFormat.format(cn, lapsUsername, lapsPassword, lapsPasswordExpiration)
-            self.__write_to_file(output_line.strip().replace(' ', ''))
-        else:
-            output_line = self.__outputFormat.format(cn, lapsPassword, lapsPasswordExpiration)
-            self.__write_to_file(output_line.strip().replace(' ', ''))
-        return laps_enabled
-
 
     def run(self):
         if self.__kdcHost is not None:
@@ -295,56 +220,89 @@ class GetLAPSPassword:
                                          "must match exactly each other.")
                 raise
 
-        logging.info('Querying %s for information about domain.' % self.__target)
-        # Print header
-        print((self.__outputFormat.format(*self.__header)))
-        print(('  '.join(['-' * itemLen for itemLen in self.__colLen])))
-
         # Building the search filter
-        searchFilter = "(&(objectCategory=computer)(ms-Mcs-AdmPwdExpirationtime=*))"  # Default search filter value
-        if self.__allComputers:
-            pass  # Already set to the default value
-        elif self.__targetComputer is not None:
-            searchFilter = "(&(objectCategory=computer)(ms-Mcs-AdmPwdExpirationtime=*)(cn=%s))"
-            searchFilter = searchFilter % self.__targetComputer
-        elif self.__lapsv2:
-            searchFilter = "(&(objectCategory=computer)(msLAPS-EncryptedPassword=*))"
-        elif self.__lapsv2 and self.__targetComputer is not None:
-            searchFilter = "(&(objectCategory=computer)(msLAPS-EncryptedPassword=*)(cn=%s))"
-            searchFilter = searchFilter % self.__targetComputer
+        searchFilter = "(&(objectCategory=computer)(|(msLAPS-EncryptedPassword=*)(ms-MCS-AdmPwd=*)(msLAPS-Password=*))"  # Default search filter value
+        if self.__targetComputer is not None:
+            searchFilter += '(name=' + self.__targetComputer + ')'
+        searchFilter += ")"
 
         try:
-            logging.debug('Search Filter=%s' % searchFilter)
-            sc = ldap.SimplePagedResultsControl(size=100)
-            # Search for computer objects and include the 'ms-MCS-AdmPwdExpirationTime' attribute
-            laps_enabled = ldapConnection.search(searchFilter=searchFilter,
-                                  attributes=['cn', 'ms-MCS-AdmPwd', 'ms-MCS-AdmPwdExpirationTime', 'msLAPS-EncryptedPassword', 'msLAPS-Password', \
-                                  'msLAPS-PasswordExpirationTime'],
-                                  sizeLimit=0, searchControls = [sc], perRecordCallback=self.processRecord)
-            if laps_enabled == False:
-                print("\n[!] LAPS is not enabled for this domain.")
+            # Microsoft Active Directory set an hard limit of 1000 entries returned by any search
+            paged_search_control = ldapasn1.SimplePagedResultsControl(criticality=True, size=1000)
 
-        except ldap.LDAPSearchError:
+            resp = ldapConnection.search(searchFilter=searchFilter,
+                                         attributes=['msLAPS-EncryptedPassword', 'msLAPS-Password', 'sAMAccountName', 'ms-MCS-AdmPwd'],
+                                         searchControls=[paged_search_control])
+
+        except ldap.LDAPSearchError as e:
+            if e.getErrorString().find('sizeLimitExceeded') >= 0:
+                # We should never reach this code as we use paged search now
+                logging.debug('sizeLimitExceeded exception caught, giving up and processing the data received')
+                resp = e.getAnswers()
+                pass
+            else:
                 raise
 
-        ldapConnection.close()
-        if self.__output_file:
-            self.__file.close()
+        entries = []
+        
+        logging.debug('Total of records returned %d' % len(resp))
+
+        if len(resp) == 0:
+            if self.__targetComputer is not None:
+                logging.error('%s$ not found in LDAP.' % self.__targetComputer)
+            else:
+                logging.error("No valid entry in LDAP")
+            return 
+        for item in resp:
+            if isinstance(item, ldapasn1.SearchResultEntry) is not True:
+                continue
+            try:
+                sAMAccountName = None
+                lapsPasswordExpiration = None
+                lapsUsername = None
+                lapsPassword = None
+                for attribute in item['attributes']:
+                    if str(attribute['type']) == 'sAMAccountName':
+                        sAMAccountName = str(attribute['vals'][0])
+                    if str(attribute['type']) == 'msLAPS-EncryptedPassword':
+                        plaintext = self.getLAPSv2Decrypt(bytes(attribute['vals'][0]))
+                        r = json.loads(plaintext[:-18].decode('utf-16le'))
+                        # timestamp = r["t"]
+                        lapsUsername = r["n"]
+                        lapsPassword = r["p"]
+                    elif str(attribute['type']) == 'ms-Mcs-AdmPwdExpirationTime':
+                        if str(attribute['vals'][0]) != '0':
+                            lapsPasswordExpiration = datetime.fromtimestamp(self.getUnixTime(int(str(attribute['vals'][0])))).strftime('%Y-%m-%d %H:%M:%S')
+                    elif str(attribute['type']) == 'ms-Mcs-AdmPwd':
+                        lapsPassword = attribute['vals'][0].asOctets().decode('utf-8')
+                if sAMAccountName is not None and lapsPassword is not None:
+                    entry = [sAMAccountName,lapsUsername, lapsPassword, lapsPasswordExpiration]
+                    entry = [element if element is not None else 'N/A' for element in entry]
+                    entries.append(entry)
+            except Exception as e:
+                logging.error('Skipping item, cannot process due to error %s' % str(e))
+                pass
+
+        if len(entries) == 0:
+            if self.__targetComputer is not None:
+                logging.error("No LAPS data returned for %s" % self.__targetComputer)
+            else:
+                logging.error("No LAPS data returned")
+            return 
+        
+        self.printTable(entries,['Host','LAPS Username','LAPS Password','LAPS Password Expiration'])
 
 # Process command-line arguments.
 if __name__ == '__main__':
     print((version.BANNER))
 
-    parser = argparse.ArgumentParser(add_help = True, description = "Queries target domain for users data")
+    parser = argparse.ArgumentParser(add_help = True, description = "Extract LAPS passwords from LDAP")
 
     parser.add_argument('target', action='store', help='domain[/username[:password]]')
     parser.add_argument('-computer', action='store', metavar='computername', help='Target a specific computer by its name')
-    parser.add_argument('-all-computers', action='store_true', help='Target all computers in the environment')
 
     parser.add_argument('-ts', action='store_true', help='Adds timestamp to every logging output')
     parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
-    parser.add_argument('-outputfile', '-o', action='store', help='Outputs to a file.')
-    parser.add_argument('-lapsv2', action='store_true', help='Toggles LAPS Version 2.0 extraction')
 
     group = parser.add_argument_group('authentication')
     group.add_argument('-hashes', action="store", metavar = "LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
@@ -369,7 +327,6 @@ if __name__ == '__main__':
         sys.exit(1)
 
     options = parser.parse_args()
-    output_file = options.outputfile
 
     # Init the example's logger theme
     logger.init(options.ts)
@@ -395,13 +352,8 @@ if __name__ == '__main__':
         options.k = True
 
     try:
-        executer = GetLAPSPassword(username, password, domain, options, output_file)
+        executer = GetLAPSPassword(username, password, domain, options)
         executer.run()
-
-        # Run the test function to create a sample output file; comment out the executor.run() above and uncomment
-        # the line below.
-        #executer.test_output_file()
-        executer.finish()
     except Exception as e:
         if logging.getLogger().level == logging.DEBUG:
             import traceback
