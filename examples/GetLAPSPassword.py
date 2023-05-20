@@ -22,7 +22,6 @@
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
-from binascii import hexlify, unhexlify
 from datetime import datetime
 from impacket import version
 from impacket.dcerpc.v5 import transport
@@ -261,10 +260,12 @@ class GetLAPSPassword:
                 lapsPasswordExpiration = None
                 lapsUsername = None
                 lapsPassword = None
+                lapsv2 = False
                 for attribute in item['attributes']:
                     if str(attribute['type']) == 'sAMAccountName':
                         sAMAccountName = str(attribute['vals'][0])
                     if str(attribute['type']) == 'msLAPS-EncryptedPassword':
+                        lapsv2 = True
                         plaintext = self.getLAPSv2Decrypt(bytes(attribute['vals'][0]))
                         r = json.loads(plaintext[:-18].decode('utf-16le'))
                         # timestamp = r["t"]
@@ -276,7 +277,7 @@ class GetLAPSPassword:
                     elif str(attribute['type']) == 'ms-Mcs-AdmPwd':
                         lapsPassword = attribute['vals'][0].asOctets().decode('utf-8')
                 if sAMAccountName is not None and lapsPassword is not None:
-                    entry = [sAMAccountName,lapsUsername, lapsPassword, lapsPasswordExpiration]
+                    entry = [sAMAccountName,lapsUsername, lapsPassword, lapsPasswordExpiration, str(lapsv2)]
                     entry = [element if element is not None else 'N/A' for element in entry]
                     entries.append(entry)
             except Exception as e:
@@ -290,7 +291,7 @@ class GetLAPSPassword:
                 logging.error("No LAPS data returned")
             return 
         
-        self.printTable(entries,['Host','LAPS Username','LAPS Password','LAPS Password Expiration'])
+        self.printTable(entries,['Host','LAPS Username','LAPS Password','LAPS Password Expiration', 'LAPSv2'])
 
 # Process command-line arguments.
 if __name__ == '__main__':
